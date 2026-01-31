@@ -1,7 +1,7 @@
 ---
-summary: "Hooks: event-driven automation for commands and lifecycle events"
+summary: "Hooks: event-driven automation for commands, session lifecycle, and agent events"
 read_when:
-  - You want event-driven automation for /new, /reset, /stop, and agent lifecycle events
+  - You want event-driven automation for /new, /reset, /stop, and agent or session lifecycle events
   - You want to build, install, or debug hooks
 ---
 # Hooks
@@ -207,6 +207,8 @@ Each event includes:
     sessionFile?: string,
     commandSource?: string,    // e.g., 'whatsapp', 'telegram'
     senderId?: string,
+    payloads?: Array<{ text: string, mediaUrls: string[], channelData?: Record<string, unknown> }>,
+    results?: Array<Record<string, unknown>>,
     workspaceDir?: string,
     bootstrapFiles?: WorkspaceBootstrapFile[],
     cfg?: OpenClawConfig
@@ -224,6 +226,16 @@ Triggered when agent commands are issued:
 - **`command:new`**: When `/new` command is issued
 - **`command:reset`**: When `/reset` command is issued
 - **`command:stop`**: When `/stop` command is issued
+
+### Session Events
+
+Triggered for session lifecycle and message flow:
+
+- **`session:created`**: When a new session is created (fresh session key)
+- **`session:message:inbound`**: When an inbound message is received
+- **`session:message:outbound`**: After an outbound message is sent (only when a session key is mirrored)
+- **`session:ended`**: When a prior session is ended (for example, after a reset)
+- **`session:reset`**: When a session reset is triggered (for example, `/new` or `/reset`)
 
 ### Agent Events
 
@@ -245,11 +257,9 @@ These hooks are not event-stream listeners; they let plugins synchronously adjus
 
 Planned event types:
 
-- **`session:start`**: When a new session begins
-- **`session:end`**: When a session ends
 - **`agent:error`**: When an agent encounters an error
-- **`message:sent`**: When a message is sent
-- **`message:received`**: When a message is received
+- **`message:sent`**: When a message is sent via external integrations
+- **`message:received`**: When a message is received via external integrations
 
 ## Creating Custom Hooks
 
@@ -381,6 +391,11 @@ The old config format still works for backwards compatibility:
         {
           "event": "command:new",
           "module": "./hooks/handlers/my-handler.ts",
+          "export": "default"
+        },
+        {
+          "event": "session:message:inbound",
+          "module": "./hooks/handlers/my-session-handler.ts",
           "export": "default"
         }
       ]

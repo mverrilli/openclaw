@@ -169,10 +169,15 @@ Currently supported events:
 - **command:new**: `/new` command specifically
 - **command:reset**: `/reset` command
 - **command:stop**: `/stop` command
+- **session:created**: session created (fresh session key)
+- **session:message:inbound**: inbound message received
+- **session:message:outbound**: outbound message sent
+- **session:ended**: session ended (e.g., reset with prior session)
+- **session:reset**: session reset trigger (e.g., `/new` or `/reset`)
 - **agent:bootstrap**: Before workspace bootstrap files are injected
 - **gateway:startup**: Gateway startup (after channels start)
 
-More event types coming soon (session lifecycle, agent errors, etc.).
+More event types coming soon (agent errors, etc.).
 
 ## Handler API
 

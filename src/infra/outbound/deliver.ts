@@ -21,6 +21,7 @@ import {
   appendAssistantMessageToSessionTranscript,
   resolveMirroredTranscriptText,
 } from "../../config/sessions.js";
+import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
 import type { NormalizedOutboundPayload } from "./payloads.js";
 import { normalizeReplyPayloadsForDelivery } from "./payloads.js";
 import type { OutboundChannel } from "./targets.js";
@@ -312,6 +313,11 @@ export async function deliverOutboundPayloads(params: {
     };
   };
   const normalizedPayloads = normalizeReplyPayloadsForDelivery(payloads);
+  const outboundPayloadSummaries = normalizedPayloads.map((payload) => ({
+    text: payload.text ?? "",
+    mediaUrls: payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []),
+    channelData: payload.channelData,
+  }));
   for (const payload of normalizedPayloads) {
     const payloadSummary: NormalizedOutboundPayload = {
       text: payload.text ?? "",
@@ -362,6 +368,23 @@ export async function deliverOutboundPayloads(params: {
         text: mirrorText,
       });
     }
+  }
+  if (params.mirror?.sessionKey && results.length > 0) {
+    const outboundEvent = createInternalHookEvent(
+      "session",
+      "message:outbound",
+      params.mirror.sessionKey,
+      {
+        channel,
+        to,
+        accountId,
+        threadId: params.threadId ?? null,
+        replyToId: params.replyToId ?? null,
+        payloads: outboundPayloadSummaries,
+        results,
+      },
+    );
+    await triggerInternalHook(outboundEvent);
   }
   return results;
 }

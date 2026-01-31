@@ -13,6 +13,7 @@ import type { MsgContext } from "../templating.js";
 import { SILENT_REPLY_TOKEN } from "../tokens.js";
 import { applyMediaUnderstanding } from "../../media-understanding/apply.js";
 import { applyLinkUnderstanding } from "../../link-understanding/apply.js";
+import { createInternalHookEvent, triggerInternalHook } from "../../hooks/internal-hooks.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import { resolveDefaultModel } from "./directive-handling.js";
 import { resolveReplyDirectives } from "./get-reply-directives.js";
@@ -125,6 +126,48 @@ export async function getReplyFromConfig(
     triggerBodyNormalized,
     bodyStripped,
   } = sessionState;
+
+  if (!opts?.isHeartbeat) {
+    const inboundEvent = createInternalHookEvent("session", "message:inbound", sessionKey ?? "", {
+      ctx: finalized,
+      sessionEntry,
+      sessionId,
+      isNewSession,
+      resetTriggered,
+      previousSessionEntry,
+    });
+    await triggerInternalHook(inboundEvent);
+
+    if (isNewSession) {
+      const createdEvent = createInternalHookEvent("session", "created", sessionKey ?? "", {
+        ctx: finalized,
+        sessionEntry,
+        sessionId,
+        resetTriggered,
+        previousSessionEntry,
+      });
+      await triggerInternalHook(createdEvent);
+    }
+
+    if (resetTriggered) {
+      const resetEvent = createInternalHookEvent("session", "reset", sessionKey ?? "", {
+        ctx: finalized,
+        sessionEntry,
+        sessionId,
+        previousSessionEntry,
+      });
+      await triggerInternalHook(resetEvent);
+    }
+
+    if (resetTriggered && previousSessionEntry) {
+      const endedEvent = createInternalHookEvent("session", "ended", sessionKey ?? "", {
+        ctx: finalized,
+        sessionEntry: previousSessionEntry,
+        sessionId: previousSessionEntry.sessionId,
+      });
+      await triggerInternalHook(endedEvent);
+    }
+  }
 
   await applyResetModelOverride({
     cfg,
