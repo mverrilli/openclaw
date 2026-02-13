@@ -3,7 +3,10 @@ import type {
   EmbeddedPiSubscribeContext,
   EmbeddedPiSubscribeState,
 } from "./pi-embedded-subscribe.handlers.types.js";
-import type { SubscribeEmbeddedPiSessionParams } from "./pi-embedded-subscribe.types.js";
+import type {
+  ActiveToolExecutionState,
+  SubscribeEmbeddedPiSessionParams,
+} from "./pi-embedded-subscribe.types.js";
 import { parseReplyDirectives } from "../auto-reply/reply/reply-directives.js";
 import { createStreamingDirectiveAccumulator } from "../auto-reply/reply/streaming-directives.js";
 import { formatToolAggregate } from "../auto-reply/tool-meta.js";
@@ -24,6 +27,7 @@ const FINAL_TAG_SCAN_RE = /<\s*(\/?)\s*final\s*>/gi;
 const log = createSubsystemLogger("agent/embedded");
 
 export type {
+  ActiveToolExecutionState,
   BlockReplyChunking,
   SubscribeEmbeddedPiSessionParams,
   ToolResultFormat,
@@ -67,6 +71,12 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     compactionRetryReject: undefined,
     compactionRetryPromise: null,
     unsubscribed: false,
+    toolExecutionCount: 0,
+    toolExecutionInFlight: false,
+    activeToolName: undefined,
+    activeToolCallId: undefined,
+    activeToolStartTime: undefined,
+    toolStartData: new Map(),
     messagingToolSentTexts: [],
     messagingToolSentTextsNormalized: [],
     messagingToolSentTargets: [],
@@ -577,6 +587,13 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     messagingToolSentTargets.length = 0;
     pendingMessagingTexts.clear();
     pendingMessagingTargets.clear();
+    // Reset tool execution tracking state to prevent stale data across compaction retries
+    state.toolExecutionCount = 0;
+    state.toolExecutionInFlight = false;
+    state.activeToolName = undefined;
+    state.activeToolCallId = undefined;
+    state.activeToolStartTime = undefined;
+    state.toolStartData.clear();
     resetAssistantMessageState(0);
   };
 
@@ -630,6 +647,26 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
       abortErr.name = "AbortError";
       reject?.(abortErr);
     }
+    // Clean up in-flight tool execution state to prevent resource leaks
+    if (state.toolExecutionInFlight) {
+      log.debug(
+        `unsubscribe: cleaning up in-flight tool execution runId=${params.runId} tool=${state.activeToolName ?? "unknown"}`,
+      );
+    }
+    state.toolExecutionCount = 0;
+    state.toolExecutionInFlight = false;
+    state.activeToolName = undefined;
+    state.activeToolCallId = undefined;
+    state.activeToolStartTime = undefined;
+    state.toolStartData.clear();
+    // Clear all tool tracking state to prevent memory leaks
+    state.toolMetaById.clear();
+    state.toolSummaryById.clear();
+    state.pendingMessagingTexts.clear();
+    state.pendingMessagingTargets.clear();
+    state.messagingToolSentTexts.length = 0;
+    state.messagingToolSentTextsNormalized.length = 0;
+    state.messagingToolSentTargets.length = 0;
     // Mark as unsubscribed to prevent waitForCompactionRetry from creating new un-resolvable promises
     state.unsubscribed = true;
     // Cancel any in-flight compaction to prevent resource leaks when unsubscribing.
@@ -651,6 +688,21 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
     unsubscribe,
     isCompacting: () => state.compactionInFlight || state.pendingCompactionRetry > 0,
     isCompactionInFlight: () => state.compactionInFlight,
+    isToolExecutionInFlight: () => state.toolExecutionCount > 0,
+    getActiveToolExecutionState: (): ActiveToolExecutionState => {
+      // Returns consistent snapshot of tool execution state. Since JavaScript is single-threaded
+      // and this method is synchronous, the field reads are atomic within the event loop.
+      // Race condition exists in caller's context: state may change between checking
+      // isToolExecutionInFlight() and calling this method.
+      const name = state.activeToolName;
+      const callId = state.activeToolCallId;
+      const startTime = state.activeToolStartTime;
+      return {
+        activeToolName: name,
+        activeToolCallId: callId,
+        activeToolStartTime: startTime,
+      };
+    },
     getMessagingToolSentTexts: () => messagingToolSentTexts.slice(),
     getMessagingToolSentTargets: () => messagingToolSentTargets.slice(),
     // Returns true if any messaging tool successfully sent a message.

@@ -4,7 +4,12 @@ import { streamSimple } from "@mariozechner/pi-ai";
 import { createAgentSession, SessionManager, SettingsManager } from "@mariozechner/pi-coding-agent";
 import fs from "node:fs/promises";
 import os from "node:os";
-import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
+import type { ActiveToolExecutionState } from "../../pi-embedded-subscribe.types.js";
+import type {
+  EmbeddedRunAttemptParams,
+  EmbeddedRunAttemptResult,
+  ToolExecutionSnapshot,
+} from "./types.js";
 import { resolveHeartbeatPrompt } from "../../../auto-reply/heartbeat.js";
 import { resolveChannelCapabilities } from "../../../config/channel-capabilities.js";
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
@@ -589,6 +594,7 @@ export async function runEmbeddedAttempt(
       let aborted = Boolean(params.abortSignal?.aborted);
       let timedOut = false;
       let timedOutDuringCompaction = false;
+      let timedOutDuringToolExecution = false;
       const getAbortReason = (signal: AbortSignal): unknown =>
         "reason" in signal ? (signal as { reason?: unknown }).reason : undefined;
       const makeTimeoutAbortReason = (): Error => {
@@ -684,6 +690,7 @@ export async function runEmbeddedAttempt(
 
       let abortWarnTimer: NodeJS.Timeout | undefined;
       const isProbeSession = params.sessionId?.startsWith("probe-") ?? false;
+      let toolStateSnapshot: ActiveToolExecutionState | undefined;
       const abortTimer = setTimeout(
         () => {
           if (!isProbeSession) {
@@ -691,11 +698,29 @@ export async function runEmbeddedAttempt(
               `embedded run timeout: runId=${params.runId} sessionId=${params.sessionId} timeoutMs=${params.timeoutMs}`,
             );
           }
-          // Only classify as compaction timeout if actual compaction is in-flight (not retry prompts).
+          // Capture tool execution state right before classification to minimize timing window
+          // where tool could complete between capture and flag check.
+          toolStateSnapshot = subscription.getActiveToolExecutionState();
+          // Classify timeout based on what was executing when it occurred.
+          // Multiple classifications can be true if, for example, tool execution completes
+          // and immediately triggers compaction, then timeout fires during compaction.
           // Using isCompactionInFlight() instead of awaitingCompaction/isCompacting() avoids
           // suppressing profile rotation for genuine provider timeouts during compaction retries.
           if (subscription.isCompactionInFlight() || activeSession.isCompacting) {
             timedOutDuringCompaction = true;
+          }
+          // Classify as tool execution timeout if a tool was actively running.
+          // Note: If tool execution completes and compaction starts before timeout,
+          // both flags may be true. Profile rotation logic should check both to avoid
+          // penalizing auth profiles for infrastructure issues (slow tools/compaction)
+          // rather than provider issues.
+          if (subscription.isToolExecutionInFlight()) {
+            timedOutDuringToolExecution = true;
+            if (!isProbeSession) {
+              log.debug(
+                `timeout classified as tool execution timeout: runId=${params.runId} tool=${toolStateSnapshot?.activeToolName ?? "unknown"}`,
+              );
+            }
           }
           abortRun(true);
           if (!abortWarnTimer) {
@@ -979,10 +1004,63 @@ export async function runEmbeddedAttempt(
         )
         .map((entry) => ({ toolName: entry.toolName, meta: entry.meta }));
 
+      // Build tool execution snapshot if we captured valid tool state during timeout.
+      // This provides debugging context about which tool was running when timeout fired.
+      // Uses state captured in timeout handler to avoid race with handleToolExecutionEnd.
+      const {
+        activeToolName: snapshotToolName,
+        activeToolCallId: snapshotToolCallId,
+        activeToolStartTime: snapshotToolStartTime,
+      } = toolStateSnapshot ?? {};
+      let toolExecutionSnapshot: ToolExecutionSnapshot | undefined;
+      const hasValidToolState =
+        typeof snapshotToolName === "string" &&
+        snapshotToolName.length > 0 &&
+        snapshotToolName.length <= 100 &&
+        typeof snapshotToolCallId === "string" &&
+        snapshotToolCallId.length > 0 &&
+        snapshotToolCallId.length <= 100 &&
+        typeof snapshotToolStartTime === "number" &&
+        snapshotToolStartTime > 0;
+      if (hasValidToolState) {
+        if (!timedOutDuringToolExecution) {
+          log.warn(
+            `tool state captured but flag not set - possible race: ` +
+              `tool=${snapshotToolName} runId=${params.runId}`,
+          );
+        }
+        const toolDuration = Date.now() - snapshotToolStartTime;
+        if (toolDuration > 0 && toolDuration < 86400000) {
+          toolExecutionSnapshot = {
+            toolName: snapshotToolName,
+            toolCallId: snapshotToolCallId,
+            startTime: snapshotToolStartTime,
+          };
+          if (!isProbeSession) {
+            log.warn(
+              `timeout during tool execution: tool=${snapshotToolName} ` +
+                `callId=${snapshotToolCallId} durationMs=${toolDuration} ` +
+                `runId=${params.runId} sessionId=${params.sessionId}`,
+            );
+          }
+        } else {
+          log.warn(
+            `invalid tool duration ${toolDuration}ms (expected 1-86400000ms) - skipping snapshot: ` +
+              `tool=${snapshotToolName} runId=${params.runId}`,
+          );
+        }
+      } else if (timedOutDuringToolExecution) {
+        if (!isProbeSession) {
+          log.warn(`timeout flag set but no valid tool state captured: runId=${params.runId}`);
+        }
+      }
+
       return {
         aborted,
         timedOut,
         timedOutDuringCompaction,
+        timedOutDuringToolExecution,
+        toolExecutionSnapshot,
         promptError,
         sessionIdUsed,
         systemPromptReport,

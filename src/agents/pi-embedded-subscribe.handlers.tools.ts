@@ -18,8 +18,6 @@ import {
 import { inferToolMetaFromArgs } from "./pi-embedded-utils.js";
 import { normalizeToolName } from "./tool-policy.js";
 
-/** Track tool execution start times and args for after_tool_call hook */
-const toolStartData = new Map<string, { startTime: number; args: unknown }>();
 function extendExecMeta(toolName: string, args: unknown, meta?: string): string | undefined {
   const normalized = toolName.trim().toLowerCase();
   if (normalized !== "exec" && normalized !== "bash") {
@@ -47,6 +45,14 @@ export async function handleToolExecutionStart(
   ctx: EmbeddedPiSubscribeContext,
   evt: AgentEvent & { toolName: string; toolCallId: string; args: unknown },
 ) {
+  // Early return FIRST if run was already unsubscribed (aborted), before touching any state.
+  // This prevents race where timeout/unsubscribe happens after event fires but before
+  // we set state, which would leave dirty state that never gets cleaned up.
+  if (ctx.state.unsubscribed) {
+    ctx.log.debug(`tool_execution_start skipped (unsubscribed): tool=${String(evt.toolName)}`);
+    return;
+  }
+
   // Flush pending block replies to preserve message boundaries before tool execution.
   ctx.flushBlockReplyBuffer();
   if (ctx.params.onBlockReplyFlush) {
@@ -58,10 +64,29 @@ export async function handleToolExecutionStart(
   const toolCallId = String(evt.toolCallId);
   const args = evt.args;
 
-  // Track start time and args for after_tool_call hook
-  toolStartData.set(toolCallId, { startTime: Date.now(), args });
+  // Check unsubscribed again after async operations (flushBlockReplyBuffer) to prevent
+  // race where timeout/unsubscribe happens during those operations, which would leave state dirty.
+  if (ctx.state.unsubscribed) {
+    ctx.log.debug(`tool_execution_start skipped (unsubscribed after flush): tool=${toolName}`);
+    return;
+  }
 
-  // Call before_tool_call hook
+  // Capture start time once for consistent timestamps across state and hook tracking.
+  const startTime = Date.now();
+
+  // Track tool execution with reference counting to properly handle concurrent tools.
+  // toolExecutionCount tracks all active tools, while activeToolName/CallId/StartTime
+  // track only the most recent (used for timeout snapshots).
+  ctx.state.toolExecutionCount++;
+  ctx.state.toolExecutionInFlight = true;
+  ctx.state.activeToolName = toolName;
+  ctx.state.activeToolCallId = toolCallId;
+  ctx.state.activeToolStartTime = startTime;
+
+  // Track start time and args for after_tool_call hook.
+  ctx.state.toolStartData.set(toolCallId, { startTime, args });
+
+  // Call before_tool_call hook.
   const hookRunner = ctx.hookRunner ?? getGlobalHookRunner();
   if (hookRunner?.hasHooks?.("before_tool_call")) {
     try {
@@ -73,6 +98,22 @@ export async function handleToolExecutionStart(
     } catch (err) {
       ctx.log.debug(`before_tool_call hook failed: tool=${toolName} error=${String(err)}`);
     }
+  }
+
+  // Check unsubscribed again after hook (another async point) to prevent
+  // state corruption if timeout/unsubscribe happened during hook execution.
+  if (ctx.state.unsubscribed) {
+    ctx.log.debug(`tool_execution_start skipped (unsubscribed after hook): tool=${toolName}`);
+    // Clean up state we just set
+    ctx.state.toolExecutionCount = Math.max(0, ctx.state.toolExecutionCount - 1);
+    ctx.state.toolExecutionInFlight = ctx.state.toolExecutionCount > 0;
+    if (ctx.state.activeToolCallId === toolCallId) {
+      ctx.state.activeToolName = undefined;
+      ctx.state.activeToolCallId = undefined;
+      ctx.state.activeToolStartTime = undefined;
+    }
+    ctx.state.toolStartData.delete(toolCallId);
+    return;
   }
 
   if (toolName === "read") {
@@ -182,99 +223,127 @@ export async function handleToolExecutionEnd(
   const toolCallId = String(evt.toolCallId);
   const isError = Boolean(evt.isError);
   const result = evt.result;
-  const isToolError = isError || isToolResultError(result);
-  const sanitizedResult = sanitizeToolResult(result);
-  const meta = ctx.state.toolMetaById.get(toolCallId);
-  ctx.state.toolMetas.push({ toolName, meta });
-  ctx.state.toolMetaById.delete(toolCallId);
-  ctx.state.toolSummaryById.delete(toolCallId);
-  if (isToolError) {
-    const errorMessage = extractToolErrorMessage(sanitizedResult);
-    ctx.state.lastToolError = {
-      toolName,
-      meta,
-      error: errorMessage,
-    };
-  }
 
-  // Commit messaging tool text on success, discard on error.
-  const pendingText = ctx.state.pendingMessagingTexts.get(toolCallId);
-  const pendingTarget = ctx.state.pendingMessagingTargets.get(toolCallId);
-  if (pendingText) {
-    ctx.state.pendingMessagingTexts.delete(toolCallId);
-    if (!isToolError) {
-      ctx.state.messagingToolSentTexts.push(pendingText);
-      ctx.state.messagingToolSentTextsNormalized.push(normalizeTextForComparison(pendingText));
-      ctx.log.debug(`Committed messaging text: tool=${toolName} len=${pendingText.length}`);
-      ctx.trimMessagingToolSent();
+  try {
+    // Early return if run was already unsubscribed (aborted).
+    // This is a race condition where the tool event fired after unsubscribe was called
+    // (e.g., timeout during tool execution). We skip the normal cleanup logic which may
+    // access already-cleared maps or attempt to emit events to a closed subscription.
+    // State clearing happens in finally block to ensure it runs in all cases.
+    if (ctx.state.unsubscribed) {
+      ctx.log.debug(`tool_execution_end skipped (unsubscribed): tool=${toolName}`);
+      return;
     }
-  }
-  if (pendingTarget) {
-    ctx.state.pendingMessagingTargets.delete(toolCallId);
-    if (!isToolError) {
-      ctx.state.messagingToolSentTargets.push(pendingTarget);
-      ctx.trimMessagingToolSent();
-    }
-  }
 
-  emitAgentEvent({
-    runId: ctx.params.runId,
-    stream: "tool",
-    data: {
-      phase: "result",
-      name: toolName,
-      toolCallId,
-      meta,
-      isError: isToolError,
-      result: sanitizedResult,
-    },
-  });
-  void ctx.params.onAgentEvent?.({
-    stream: "tool",
-    data: {
-      phase: "result",
-      name: toolName,
-      toolCallId,
-      meta,
-      isError: isToolError,
-    },
-  });
-
-  ctx.log.debug(
-    `embedded run tool end: runId=${ctx.params.runId} tool=${toolName} toolCallId=${toolCallId}`,
-  );
-
-  if (ctx.params.onToolResult && ctx.shouldEmitToolOutput()) {
-    const outputText = extractToolResultText(sanitizedResult);
-    if (outputText) {
-      ctx.emitToolOutput(toolName, meta, outputText);
-    }
-  }
-
-  // Run after_tool_call plugin hook (fire-and-forget)
-  const hookRunnerAfter = ctx.hookRunner ?? getGlobalHookRunner();
-  if (hookRunnerAfter?.hasHooks("after_tool_call")) {
-    const startData = toolStartData.get(toolCallId);
-    toolStartData.delete(toolCallId);
-    const durationMs = startData?.startTime != null ? Date.now() - startData.startTime : undefined;
-    const toolArgs = startData?.args;
-    const hookEvent: PluginHookAfterToolCallEvent = {
-      toolName,
-      params: (toolArgs && typeof toolArgs === "object" ? toolArgs : {}) as Record<string, unknown>,
-      result: sanitizedResult,
-      error: isToolError ? extractToolErrorMessage(sanitizedResult) : undefined,
-      durationMs,
-    };
-    void hookRunnerAfter
-      .runAfterToolCall(hookEvent, {
+    const isToolError = isError || isToolResultError(result);
+    const sanitizedResult = sanitizeToolResult(result);
+    const meta = ctx.state.toolMetaById.get(toolCallId);
+    ctx.state.toolMetas.push({ toolName, meta });
+    ctx.state.toolMetaById.delete(toolCallId);
+    ctx.state.toolSummaryById.delete(toolCallId);
+    if (isToolError) {
+      const errorMessage = extractToolErrorMessage(sanitizedResult);
+      ctx.state.lastToolError = {
         toolName,
-        agentId: undefined,
-        sessionKey: undefined,
-      })
-      .catch((err) => {
-        ctx.log.warn(`after_tool_call hook failed: tool=${toolName} error=${String(err)}`);
-      });
-  } else {
-    toolStartData.delete(toolCallId);
+        meta,
+        error: errorMessage,
+      };
+    }
+
+    // Commit messaging tool text on success, discard on error.
+    const pendingText = ctx.state.pendingMessagingTexts.get(toolCallId);
+    const pendingTarget = ctx.state.pendingMessagingTargets.get(toolCallId);
+    if (pendingText) {
+      ctx.state.pendingMessagingTexts.delete(toolCallId);
+      if (!isToolError) {
+        ctx.state.messagingToolSentTexts.push(pendingText);
+        ctx.state.messagingToolSentTextsNormalized.push(normalizeTextForComparison(pendingText));
+        ctx.log.debug(`Committed messaging text: tool=${toolName} len=${pendingText.length}`);
+        ctx.trimMessagingToolSent();
+      }
+    }
+    if (pendingTarget) {
+      ctx.state.pendingMessagingTargets.delete(toolCallId);
+      if (!isToolError) {
+        ctx.state.messagingToolSentTargets.push(pendingTarget);
+        ctx.trimMessagingToolSent();
+      }
+    }
+
+    emitAgentEvent({
+      runId: ctx.params.runId,
+      stream: "tool",
+      data: {
+        phase: "result",
+        name: toolName,
+        toolCallId,
+        meta,
+        isError: isToolError,
+        result: sanitizedResult,
+      },
+    });
+    void ctx.params.onAgentEvent?.({
+      stream: "tool",
+      data: {
+        phase: "result",
+        name: toolName,
+        toolCallId,
+        meta,
+        isError: isToolError,
+      },
+    });
+
+    ctx.log.debug(
+      `embedded run tool end: runId=${ctx.params.runId} tool=${toolName} toolCallId=${toolCallId}`,
+    );
+
+    if (ctx.params.onToolResult && ctx.shouldEmitToolOutput()) {
+      const outputText = extractToolResultText(sanitizedResult);
+      if (outputText) {
+        ctx.emitToolOutput(toolName, meta, outputText);
+      }
+    }
+
+    // Run after_tool_call plugin hook (fire-and-forget).
+    const hookRunnerAfter = ctx.hookRunner ?? getGlobalHookRunner();
+    if (hookRunnerAfter?.hasHooks("after_tool_call")) {
+      const startData = ctx.state.toolStartData.get(toolCallId);
+      const durationMs =
+        startData?.startTime != null ? Date.now() - startData.startTime : undefined;
+      const toolArgs = startData?.args;
+      const hookEvent: PluginHookAfterToolCallEvent = {
+        toolName,
+        params: (toolArgs && typeof toolArgs === "object" ? toolArgs : {}) as Record<
+          string,
+          unknown
+        >,
+        result: sanitizedResult,
+        error: isToolError ? extractToolErrorMessage(sanitizedResult) : undefined,
+        durationMs,
+      };
+      void hookRunnerAfter
+        .runAfterToolCall(hookEvent, {
+          toolName,
+          agentId: undefined,
+          sessionKey: undefined,
+        })
+        .catch((err) => {
+          ctx.log.warn(`after_tool_call hook failed: tool=${toolName} error=${String(err)}`);
+        });
+    }
+  } finally {
+    // Decrement reference count (use Math.max to prevent going negative if called multiple times)
+    ctx.state.toolExecutionCount = Math.max(0, ctx.state.toolExecutionCount - 1);
+    ctx.state.toolExecutionInFlight = ctx.state.toolExecutionCount > 0;
+
+    // Only clear snapshot state if it still points to THIS tool.
+    // For concurrent tools, activeToolName/CallId/StartTime track only the most recent.
+    if (ctx.state.activeToolCallId === toolCallId) {
+      ctx.state.activeToolName = undefined;
+      ctx.state.activeToolCallId = undefined;
+      ctx.state.activeToolStartTime = undefined;
+    }
+    // Always clean up per-tool tracking map to prevent memory leaks
+    ctx.state.toolStartData.delete(toolCallId);
   }
 }
