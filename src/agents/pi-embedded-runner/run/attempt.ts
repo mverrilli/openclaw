@@ -704,9 +704,9 @@ export async function runEmbeddedAttempt(
           // Classify timeout based on what was executing when it occurred.
           // Multiple classifications can be true if, for example, tool execution completes
           // and immediately triggers compaction, then timeout fires during compaction.
-          // Using isCompactionInFlight() instead of awaitingCompaction/isCompacting() avoids
-          // suppressing profile rotation for genuine provider timeouts during compaction retries.
-          if (subscription.isCompactionInFlight() || activeSession.isCompacting) {
+          // Check full compaction lifecycle (in-flight + pending retry) to avoid penalizing
+          // auth profiles for infrastructure timeouts during compaction.
+          if (subscription.isCompacting() || activeSession.isCompacting) {
             timedOutDuringCompaction = true;
           }
           // Classify as tool execution timeout if a tool was actively running.
