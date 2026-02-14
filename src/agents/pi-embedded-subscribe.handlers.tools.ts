@@ -78,7 +78,7 @@ export async function handleToolExecutionStart(
   // toolExecutionCount tracks all active tools, while activeToolName/CallId/StartTime
   // track only the most recent (used for timeout snapshots).
   ctx.state.toolExecutionCount++;
-  ctx.state.toolExecutionInFlight = ctx.state.toolExecutionCount > 0;
+  ctx.state.toolExecutionInFlight = true;
   ctx.state.activeToolName = toolName;
   ctx.state.activeToolCallId = toolCallId;
   ctx.state.activeToolStartTime = startTime;
@@ -332,16 +332,25 @@ export async function handleToolExecutionEnd(
         });
     }
   } finally {
-    // Decrement reference count (use Math.max to prevent going negative if called multiple times)
-    ctx.state.toolExecutionCount = Math.max(0, ctx.state.toolExecutionCount - 1);
-    ctx.state.toolExecutionInFlight = ctx.state.toolExecutionCount > 0;
+    // Skip all state updates if unsubscribed to prevent interfering with
+    // concurrent tools or stale state after subscription cleanup.
+    if (!ctx.state.unsubscribed) {
+      // Only decrement if this tool was actually tracked (i.e., handleToolExecutionStart
+      // got past unsubscribe checks and incremented the count). Check toolStartData presence
+      // BEFORE deleting it.
+      const wasTracked = ctx.state.toolStartData.has(toolCallId);
+      if (wasTracked) {
+        ctx.state.toolExecutionCount = Math.max(0, ctx.state.toolExecutionCount - 1);
+        ctx.state.toolExecutionInFlight = ctx.state.toolExecutionCount > 0;
+      }
 
-    // Only clear snapshot state if it still points to THIS tool.
-    // For concurrent tools, activeToolName/CallId/StartTime track only the most recent.
-    if (ctx.state.activeToolCallId === toolCallId) {
-      ctx.state.activeToolName = undefined;
-      ctx.state.activeToolCallId = undefined;
-      ctx.state.activeToolStartTime = undefined;
+      // Only clear snapshot state if it still points to THIS tool AND we tracked it.
+      // For concurrent tools, activeToolName/CallId/StartTime track only the most recent.
+      if (wasTracked && ctx.state.activeToolCallId === toolCallId) {
+        ctx.state.activeToolName = undefined;
+        ctx.state.activeToolCallId = undefined;
+        ctx.state.activeToolStartTime = undefined;
+      }
     }
     // Always clean up per-tool tracking map to prevent memory leaks
     ctx.state.toolStartData.delete(toolCallId);
